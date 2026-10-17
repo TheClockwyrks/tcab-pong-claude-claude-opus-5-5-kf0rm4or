@@ -1,41 +1,18 @@
-// Carom — the game. THIS IS THE FILE YOU IMPLEMENT.
+// Carom — the game: the state it holds, the debug surface that poses and reads
+// that state, and the three functions the engine drives.
 //
-// `src/main.ts`, `src/constants.ts` and the project's configuration are supplied
-// with the project and stay as they are. What is missing is the game: the state it
-// holds, the debug surface that poses and reads that state, and the three
-// functions below.
+// The state is a value. `update` builds the next state from the current one and
+// `render` draws it; neither writes into what it was handed. The work itself
+// lives in the modules beside this one:
 //
-// FIRST, DECLARE AND EXPORT `CaromState`, exactly as `specs/state.md` fixes it,
-// and `CaromDebugApi`, the debug and automation surface `specs/instrumentation.md`
-// specifies. The stub below is written against both names, so this project does
-// not compile until they exist — the type check failing on a fresh checkout is
-// the starting point, not a fault in the project.
-//
-// THEN IMPLEMENT the three functions. `initialize` runs once, when the engine is
-// initialized, and returns the state and the debug surface together, as the pair
-// `[state, debug]`. `update` and `render` then run once each per frame — `update`
-// first, with the frame's delta time in SECONDS, then `render`.
-//
-// The state is a VALUE, and every frame is a transition over it. The engine hands
-// `update` the current state as a read-only view (`DeepReadonly<CaromState>`)
-// and stores whatever `update` returns as the next state; `render` is handed
-// that next state, as the same read-only view, and returns nothing. Nothing ever
-// holds a writable `CaromState`: `update` builds the next state from the current
-// one rather than assigning into it, and a frame that returns `undefined` is
-// refused by the engine. The engine's own documentation, at `engine/`, defines
-// all of this and the scoped APIs each function receives; read it before you
-// start.
-//
-// The engine returns the surface from `engine.debug`, exactly as `initialize`
-// handed it over, which is how the game is driven from code
-// (`specs/instrumentation.md`). Because no one holds a writable state, the
-// surface is written in the shape of `update`: every operation takes the current
-// state first, then the arguments its heading names. A pose returns the next
-// state (`setScreen(state, screen)`); a reading returns what it read
-// (`snapshot(state)`, `menuItemRect(state, index)`). A caller drives them
-// through `engine.apply` and `engine.state`. Where its implementation lives
-// under `src/` is your call; the only fixed point is that `initialize` returns
-// it.
+//   state.ts       building, parking, starting a match, returning to the title
+//   physics.ts     paddles, the AI, the ball's sub-stepped flight and collisions
+//   simulation.ts  one countdown or playing frame of the field
+//   menus.ts       the menu layouts, keyboard navigation, pointer and touch
+//   frame.ts       one whole update: input first, then the screen it left
+//   debug.ts       the debug and automation surface
+//   render.ts      everything drawn
+//   audio.ts       the cue definitions
 
 import type {
   Game,
@@ -44,66 +21,109 @@ import type {
   UpdateApi,
 } from "@clockwyrks/simple-2d";
 import type { DeepReadonly } from "ts-essentials";
+import { ACTIONS, BINDINGS, CUES } from "./constants";
+import { CUE_SPECS } from "./audio";
+import { createDebugApi, registerDiagnostics } from "./debug";
+import type { CaromDebugApi } from "./debug";
+import { updateFrame } from "./frame";
+import { PALETTE } from "./palette";
+import { renderFrame } from "./render";
+import { titleState } from "./state";
 
-/**
- * The field background, a CSS color string. `src/main.ts` hands it to the engine
- * as the color the canvas is cleared to each frame, so the letterbox bars around
- * the field match the field itself. This placeholder is replaced by the build
- * with the color its field uses.
- */
-export const BACKGROUND = "#000";
+export type { CaromDebugApi, CaromSnapshot } from "./debug";
 
-const NOT_IMPLEMENTED = "Carom: src/game.ts is not implemented yet";
+// ---- The declared state (specs/state.md) ----------------------------------
 
-/**
- * The game this build's engine drives.
- *
- * Implement all three functions. Nothing else in the project needs changing for
- * the game to run: `src/main.ts` already binds this object to the engine.
- */
+export type Screen =
+  "title" | "howto" | "countdown" | "playing" | "paused" | "matchover";
+
+export type Mode = "solo" | "versus";
+
+export type Side = "left" | "right";
+
+export interface PaddleState {
+  readonly cy: number;
+  readonly vy: number;
+  readonly driven: boolean;
+  readonly drivenVy: number;
+}
+
+export interface AiState {
+  readonly tracking: boolean;
+  readonly movement: boolean;
+}
+
+export interface TrailSample {
+  readonly x: number;
+  readonly y: number;
+  readonly t: number;
+}
+
+export interface BallState {
+  readonly x: number;
+  readonly y: number;
+  readonly vx: number;
+  readonly vy: number;
+  readonly spin: number;
+  readonly held: boolean;
+  readonly holdTimer: number;
+  readonly serveSign: 1 | -1;
+  readonly trail: readonly TrailSample[];
+}
+
+export interface ObstacleState {
+  readonly index: number;
+  readonly cx: number;
+  readonly cy: number;
+}
+
+export interface CaromState {
+  readonly screen: Screen;
+  readonly mode: Mode;
+  readonly menuIndex: number;
+  readonly titleIndex: number;
+  readonly resumeScreen: "countdown" | "playing";
+
+  readonly score: { readonly p1: number; readonly p2: number };
+  readonly winner: Side | null;
+
+  readonly paddles: { readonly left: PaddleState; readonly right: PaddleState };
+  readonly ai: AiState;
+
+  readonly receiver: Side;
+  readonly ball: BallState | null;
+  readonly obstacles: readonly ObstacleState[];
+
+  readonly simTime: number;
+  readonly muted: boolean;
+}
+
+/** The field background; also the letterbox color `src/main.ts` clears to. */
+export const BACKGROUND = PALETTE.background;
+
 export const game: Game<CaromState, CaromDebugApi> = {
-  /**
-   * Runs once, before any frame.
-   *
-   * Register every action in ACTIONS against its BINDINGS, define every cue in
-   * CUES, register the diagnostic sources specs/instrumentation.md lists, and
-   * build the complete initial state: the title screen, with every field of
-   * CaromState set. Return it beside the debug surface. Each diagnostic source
-   * is handed the state current at the read, so none closes over the state
-   * built here.
-   */
-  initialize(_api: InitApi<CaromState>): [CaromState, CaromDebugApi] {
-    throw new Error(NOT_IMPLEMENTED);
+  initialize(api: InitApi<CaromState>): [CaromState, CaromDebugApi] {
+    for (const name of ACTIONS) {
+      api.input.register(name, { keys: [...BINDINGS[name]] });
+    }
+    for (const cue of Object.values(CUES)) {
+      api.audio.define(cue, CUE_SPECS[cue]);
+    }
+    registerDiagnostics(api.diagnostics);
+
+    // The bus starts unmuted, and only this game ever changes it.
+    return [titleState(false), createDebugApi()];
   },
 
-  /**
-   * Runs once per frame, before `render`: the next state, from the current one.
-   *
-   * `dt` is the real elapsed SECONDS of this frame. Every rate in
-   * `src/constants.ts` is per second and is multiplied by it, so the same
-   * interval of game time reaches the same state however it was divided into
-   * frames. Read input, advance the simulation, play cues, and mirror the
-   * engine's mute bit into the returned state's `muted`. The value returned is
-   * what `render` draws and what the next `update` receives; `state` itself is
-   * read-only and stays as it was.
-   */
   update(
-    _state: DeepReadonly<CaromState>,
-    _api: UpdateApi,
-    _dt: number,
+    state: DeepReadonly<CaromState>,
+    api: UpdateApi,
+    dt: number,
   ): CaromState {
-    throw new Error(NOT_IMPLEMENTED);
+    return updateFrame(state, api, dt);
   },
 
-  /**
-   * Runs once per frame, after `update`, with the state `update` returned.
-   *
-   * `api.ctx` arrives cleared and already carrying the logical transform, so draw
-   * in 1280x720 coordinates and never read the canvas element's size. The state
-   * arrives read-only, so the type is what guarantees that rendering changes
-   * nothing.
-   */
-  render(_state: DeepReadonly<CaromState>, _api: RenderApi): void {
-    throw new Error(NOT_IMPLEMENTED);
+  render(state: DeepReadonly<CaromState>, api: RenderApi): void {
+    renderFrame(state, api.ctx);
   },
 };
